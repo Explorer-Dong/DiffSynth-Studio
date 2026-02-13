@@ -21,6 +21,7 @@ class ModelLogger:
         state_dict = accelerator.get_state_dict(model)
         if accelerator.is_main_process:
             state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
+            state_dict = ModelLogger.filter_state_dict(state_dict)
             state_dict = self.state_dict_converter(state_dict)
             os.makedirs(self.output_path, exist_ok=True)
             path = os.path.join(self.output_path, f"epoch-{epoch_id}.safetensors")
@@ -37,7 +38,23 @@ class ModelLogger:
         state_dict = accelerator.get_state_dict(model)
         if accelerator.is_main_process:
             state_dict = accelerator.unwrap_model(model).export_trainable_state_dict(state_dict, remove_prefix=self.remove_prefix_in_ckpt)
+            state_dict = ModelLogger.filter_state_dict(state_dict)
             state_dict = self.state_dict_converter(state_dict)
             os.makedirs(self.output_path, exist_ok=True)
             path = os.path.join(self.output_path, file_name)
             accelerator.save(state_dict, path, safe_serialization=True)
+
+    @staticmethod
+    def filter_state_dict(state_dict: dict) -> dict:
+        filtered_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("pipe.dit"):
+                # Exclude teacher pipe.dit parameters
+                continue
+            elif key.startswith("pipe_stu.dit."):
+                # Remove pipe_stu.dit. prefix
+                new_key = key[len("pipe_stu.dit.") :]
+                filtered_state_dict[new_key] = value
+            else:
+                filtered_state_dict[key] = value
+        return filtered_state_dict

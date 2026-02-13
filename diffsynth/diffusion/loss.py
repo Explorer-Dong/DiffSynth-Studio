@@ -1,5 +1,6 @@
-from .base_pipeline import BasePipeline
 import torch
+
+from .base_pipeline import BasePipeline
 
 
 def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
@@ -28,6 +29,37 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
     return loss
 
 
+def SLASFTLoss(pipe: BasePipeline, pipe_stu: BasePipeline, **inputs):
+    max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps))
+    min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps))
+
+    timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+    timestep = pipe.scheduler.timesteps[timestep_id].to(dtype=pipe.torch_dtype, device=pipe.device)
+
+    noise = torch.randn_like(inputs["input_latents"])
+    inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timestep)
+
+    if "first_frame_latents" in inputs:
+        inputs["latents"][:, :, 0:1] = inputs["first_frame_latents"]
+
+    # Teacher: frozen, no grad
+    teacher_models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+    with torch.no_grad():
+        noise_pred_teacher = pipe.model_fn(**teacher_models, **inputs, timestep=timestep)
+
+    # Student: with SLA attention, trainable
+    student_models = {name: getattr(pipe_stu, name) for name in pipe_stu.in_iteration_models}
+    noise_pred_stu = pipe_stu.model_fn(**student_models, **inputs, timestep=timestep)
+
+    if "first_frame_latents" in inputs:
+        noise_pred_teacher = noise_pred_teacher[:, :, 1:]
+        noise_pred_stu = noise_pred_stu[:, :, 1:]
+
+    loss = torch.nn.functional.mse_loss(noise_pred_stu.float(), noise_pred_teacher.float())
+    loss = loss * pipe.scheduler.training_weight(timestep)
+    return loss
+
+
 def DirectDistillLoss(pipe: BasePipeline, **inputs):
     pipe.scheduler.set_timesteps(inputs["num_inference_steps"])
     pipe.scheduler.training = True
@@ -46,7 +78,7 @@ class TrajectoryImitationLoss(torch.nn.Module):
         self.initialized = False
     
     def initialize(self, device):
-        import lpips # TODO: remove it
+        import lpips  # TODO: remove it
         self.loss_fn = lpips.LPIPS(net='alex').to(device)
         self.initialized = True
 

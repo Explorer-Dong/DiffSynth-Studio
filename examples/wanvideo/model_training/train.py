@@ -1,10 +1,11 @@
 import torch, os, argparse, accelerate, warnings
 from diffsynth.core import UnifiedDataset
 from diffsynth.core.data.operators import LoadVideo, LoadAudio, ImageCropAndResize, ToAbsolutePath
+from diffsynth.core.loader.model import replace_attention_with_sla
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import *
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
+os.environ["DIFFSYNTH_DOWNLOAD_SOURCE"] = "huggingface"
 
 class WanTrainingModule(DiffusionTrainingModule):
     def __init__(
@@ -36,10 +37,17 @@ class WanTrainingModule(DiffusionTrainingModule):
         audio_processor_config = self.parse_path_or_model_id(audio_processor_path)
         self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, audio_processor_config=audio_processor_config)
         self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
+        self.pipe_stu = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device=device, model_configs=model_configs, tokenizer_config=tokenizer_config, audio_processor_config=audio_processor_config)
+        self.pipe_stu = self.split_pipeline_units(task, self.pipe_stu, trainable_models, lora_base_model)
+        self.pipe_stu = replace_attention_with_sla(self.pipe_stu)
         
-        # Training mode
+        # Teacher pipe: completely frozen (no training, no gradient)
+        self.pipe.scheduler.set_timesteps(1000, training=True)
+        self.pipe.freeze_except([])  # sets eval() + requires_grad_(False) on entire teacher pipe
+        
+        # Student pipe: trainable
         self.switch_pipe_to_training_mode(
-            self.pipe, trainable_models,
+            self.pipe_stu, trainable_models,
             lora_base_model, lora_target_modules, lora_rank, lora_checkpoint,
             preset_lora_path, preset_lora_model,
             task=task,
@@ -56,6 +64,7 @@ class WanTrainingModule(DiffusionTrainingModule):
             "direct_distill:data_process": lambda pipe, *args: args,
             "sft": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
             "sft:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: FlowMatchSFTLoss(pipe, **inputs_shared, **inputs_posi),
+            "sla_sft": lambda pipe, pipe_stu, inputs_shared, inputs_posi, inputs_nega: SLASFTLoss(pipe, pipe_stu, **inputs_shared, **inputs_posi),
             "direct_distill": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
             "direct_distill:train": lambda pipe, inputs_shared, inputs_posi, inputs_nega: DirectDistillLoss(pipe, **inputs_shared, **inputs_posi),
         }
@@ -104,7 +113,7 @@ class WanTrainingModule(DiffusionTrainingModule):
         inputs = self.transfer_data_to_device(inputs, self.pipe.device, self.pipe.torch_dtype)
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
-        loss = self.task_to_loss[self.task](self.pipe, *inputs)
+        loss = self.task_to_loss[self.task](self.pipe, self.pipe_stu, *inputs)
         return loss
 
 
@@ -179,6 +188,7 @@ if __name__ == "__main__":
         "direct_distill:data_process": launch_data_process_task,
         "sft": launch_training_task,
         "sft:train": launch_training_task,
+        "sla_sft": launch_training_task,
         "direct_distill": launch_training_task,
         "direct_distill:train": launch_training_task,
     }

@@ -6,6 +6,47 @@ import torch
 from contextlib import contextmanager
 from transformers.integrations import is_deepspeed_zero3_enabled
 from transformers.utils import ContextManagers
+import os
+import torch.nn as nn
+from diffsynth.models.wan_video_dit import WanModel
+from einops import rearrange
+from sparse_linear_attention import SparseLinearAttention
+
+from diffsynth.models.wan_video_dit import SelfAttention
+
+
+class AdaptedSLA(nn.Module):
+    """
+    q, k, v shape of Diffsynth: (B, S, N*D)
+    q, k, v shape of SLA: (B, H, L, D)
+    """
+
+    def __init__(self, num_heads: int, head_dim: int, sla_topk: float = 0.1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.sla = SparseLinearAttention(head_dim=head_dim, topk=sla_topk)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        # (B, S, N*D) -> (B, H, L, D)
+        q = rearrange(q, "b s (n d) -> b n s d", n=self.num_heads)
+        k = rearrange(k, "b s (n d) -> b n s d", n=self.num_heads)
+        v = rearrange(v, "b s (n d) -> b n s d", n=self.num_heads)
+        # sparse linear attention
+        o = self.sla(q, k, v)
+        # (B, H, L, D) -> (B, S, N*D)
+        o = rearrange(o, "b n s d -> b s (n d)")
+        return o
+
+
+def replace_attention_with_sla(model: nn.Module, sla_topk: float = 0.1, device: str = "cuda"):
+    replaced_count = 0
+    for module in model.modules():
+        if isinstance(module, SelfAttention):
+            module.attn = AdaptedSLA(num_heads=module.num_heads, head_dim=module.head_dim, sla_topk=sla_topk).to(device)
+            replaced_count += 1
+    print(f"[SLA] Replaced [{replaced_count}] SelfAttention Module")
+    return model
 
 
 def load_model(model_class, path, config=None, torch_dtype=torch.bfloat16, device="cpu", state_dict_converter=None, use_disk_map=False, module_map=None, vram_config=None, vram_limit=None, state_dict=None):
