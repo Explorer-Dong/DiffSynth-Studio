@@ -53,6 +53,8 @@ def load_model(model_class, path, config=None, torch_dtype=torch.bfloat16, devic
     config = {} if config is None else config
     with ContextManagers(get_init_context(torch_dtype=torch_dtype, device=device)):
         model = model_class(**config)
+    if isinstance(model, WanModel) and os.environ.get("INFERENCE_MODE") == "sla_sft":
+        model = replace_attention_with_sla(model)
     # What is `module_map`?
     # This is a module mapping table for VRAM management.
     if module_map is not None:
